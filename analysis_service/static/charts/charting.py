@@ -1,12 +1,10 @@
 from pathlib import Path
 import uuid
-
 import matplotlib.pyplot as plt
 import pandas as pd
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-CHART_DIR = BASE_DIR / "static" / "charts"
+CHART_DIR = Path("static/charts")
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -16,6 +14,7 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     categorical_cols = df.select_dtypes(exclude="number").columns.tolist()
 
+    # 1) Histogram for the first numeric column
     if numeric_cols:
         col = numeric_cols[0]
         fig, ax = plt.subplots()
@@ -32,9 +31,10 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
             "type": "histogram",
             "column": col,
             "title": f"Distribution of {col}",
-            "path": f"/static/charts/{filename}",
+            "path": f"/static/charts/{filename}"
         })
 
+    # 2) Bar chart for the first categorical column
     if categorical_cols:
         col = categorical_cols[0]
         value_counts = df[col].astype(str).value_counts().head(10)
@@ -54,7 +54,7 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
             "type": "bar",
             "column": col,
             "title": f"Top values in {col}",
-            "path": f"/static/charts/{filename}",
+            "path": f"/static/charts/{filename}"
         })
 
     return charts
