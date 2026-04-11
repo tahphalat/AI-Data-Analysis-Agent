@@ -1,8 +1,9 @@
 from io import BytesIO
+import json
 from typing import Any
 
 import pandas as pd
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request, Form
 
 from app.schemas.response import AnalyzeResponse
 from app.services.aggregations import (
@@ -15,7 +16,7 @@ from app.services.aggregations import (
 from app.services.insights import build_summary_for_user
 from app.services.file_loader import load_dataframe
 from app.services.profiler import profile_dataframe
-from app.services.charting import generate_basic_charts
+from app.services.charting import generate_charts
 from app.services.validators import assess_data_quality
 
 router = APIRouter()
@@ -27,10 +28,38 @@ def _model_to_dict(model: AnalyzeResponse) -> dict[str, Any]:
     return model.dict(exclude_none=True)
 
 
+def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]] | None:
+    if raw_chart_requests is None:
+        return None
+
+    raw = raw_chart_requests.strip()
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid chart_requests JSON: {str(exc)}",
+        ) from exc
+
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        return parsed
+
+    raise HTTPException(
+        status_code=400,
+        detail="chart_requests must be a JSON object or a JSON array of objects",
+    )
+
+
 def _build_analysis_payload(
     df: pd.DataFrame,
     filename: str | None = None,
     status: str | None = None,
+    chart_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     profile_result = profile_dataframe(df)
 
@@ -51,7 +80,11 @@ def _build_analysis_payload(
         column_map=enriched_column_map,
     )
 
-    charts = generate_basic_charts(enriched_df)
+    charts = generate_charts(
+        enriched_df,
+        column_map=enriched_column_map,
+        chart_requests=chart_requests,
+    )
     insights = [
         f"The dataset contains {enriched_df.shape[0]} rows and {enriched_df.shape[1]} columns.",
         f"There are {len(profile_result['numeric_columns'])} numeric columns and {len(profile_result['categorical_columns'])} categorical columns.",
@@ -123,12 +156,22 @@ async def profile(file: UploadFile = File(...)):
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(file: UploadFile = File(...)):
+async def analyze(
+    file: UploadFile = File(...),
+    chart_requests: str | None = Form(None),
+):
     try:
         file_bytes = await file.read()
         df = load_dataframe(file.filename, file_bytes)
-        return _build_analysis_payload(df, filename=file.filename)
+        parsed_chart_requests = _parse_chart_requests(chart_requests)
+        return _build_analysis_payload(
+            df,
+            filename=file.filename,
+            chart_requests=parsed_chart_requests,
+        )
 
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -139,7 +182,7 @@ async def analyze(file: UploadFile = File(...)):
 
 
 @router.post("/analyze-binary", response_model=AnalyzeResponse)
-async def analyze_binary(request: Request):
+async def analyze_binary(request: Request, chart_requests: str | None = None):
     try:
         file_bytes = await request.body()
 
@@ -153,8 +196,15 @@ async def analyze_binary(request: Request):
         print(text[:200])
 
         df = pd.read_csv(BytesIO(file_bytes))
-        return _build_analysis_payload(df, status="success")
+        parsed_chart_requests = _parse_chart_requests(chart_requests)
+        return _build_analysis_payload(
+            df,
+            status="success",
+            chart_requests=parsed_chart_requests,
+        )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
