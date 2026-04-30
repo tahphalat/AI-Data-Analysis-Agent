@@ -49,7 +49,27 @@ def test_profile_marks_unique_id_columns_as_identifier() -> None:
 
     assert profile["semantic_columns"]["order_id"] == "identifier"
     assert profile["semantic_columns"]["customer_id"] == "identifier"
-    assert profile["semantic_columns"]["amount"] == "numeric_feature"
+    assert profile["semantic_columns"]["amount"] == "measure"
+    assert profile["semantic_profile"]["order_id"]["confidence"] >= 0.7
+    assert profile["semantic_profile"]["order_id"]["reasons"]
+
+
+def test_profile_marks_common_code_columns_as_identifiers() -> None:
+    df = pd.DataFrame(
+        {
+            "invoice_no": ["INV-001", "INV-002", "INV-003"],
+            "sku": ["SKU-001", "SKU-002", "SKU-003"],
+            "transaction_number": [1001, 1002, 1003],
+            "revenue": [10.0, 15.0, 20.0],
+        }
+    )
+
+    profile = profile_dataframe(df)
+
+    assert profile["semantic_columns"]["invoice_no"] == "identifier"
+    assert profile["semantic_columns"]["sku"] == "identifier"
+    assert profile["semantic_columns"]["transaction_number"] == "identifier"
+    assert profile["semantic_columns"]["revenue"] == "measure"
 
 
 def test_profile_does_not_treat_valid_as_id_name() -> None:
@@ -57,7 +77,7 @@ def test_profile_does_not_treat_valid_as_id_name() -> None:
 
     profile = profile_dataframe(df)
 
-    assert profile["semantic_columns"]["valid"] == "numeric_feature"
+    assert profile["semantic_columns"]["valid"] != "identifier"
 
 
 def test_default_charts_skip_id_histogram_and_count_species(monkeypatch) -> None:
@@ -70,7 +90,10 @@ def test_default_charts_skip_id_histogram_and_count_species(monkeypatch) -> None
 
     assert histogram["column"] == "SepalLengthCm"
     assert histogram["column"] != "Id"
-    assert "Identifier columns were skipped" in histogram["warnings"][0]
+    assert any(
+        "Identifier columns were skipped" in warning
+        for warning in histogram["warnings"]
+    )
     assert bar["column"] == "Species"
     assert bar["title"] == "Record Count by Species"
 
@@ -89,7 +112,10 @@ def test_histogram_request_for_id_converts_to_sequence_scatter(monkeypatch) -> N
     assert chart["type"] == "scatter"
     assert chart["x_column"] == "__row_index"
     assert chart["y_column"] == "Id"
-    assert "histogram was not selected" in chart["warnings"][0]
+    assert any(
+        "histogram was not selected" in warning
+        for warning in chart["warnings"]
+    )
 
 
 def test_explicit_sequence_scatter_uses_row_order_for_id(monkeypatch) -> None:
