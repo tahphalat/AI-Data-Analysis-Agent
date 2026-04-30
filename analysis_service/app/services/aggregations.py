@@ -35,6 +35,16 @@ COLUMN_CANDIDATES: dict[str, list[str]] = {
     ],
     "cost": ["cost", "unitcost", "totalcost", "cogs"],
     "margin": ["margin", "profit", "grossprofit"],
+    "order_date": [
+        "order_date",
+        "orderdate",
+        "date",
+        "datetime",
+        "timestamp",
+        "created_at",
+        "transaction_date",
+        "year_month",
+    ],
 }
 
 

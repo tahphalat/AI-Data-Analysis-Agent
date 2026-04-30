@@ -1,5 +1,7 @@
 from io import BytesIO
+import ast
 import json
+import os
 from typing import Any
 
 import pandas as pd
@@ -13,7 +15,7 @@ from app.services.aggregations import (
     ensure_revenue_column,
     infer_business_columns,
 )
-from app.services.insights import build_summary_for_user
+from app.services.insights import build_summary_for_user, build_summary_for_user_text
 from app.services.file_loader import load_dataframe
 from app.services.profiler import profile_dataframe
 from app.services.charting import generate_charts
@@ -39,10 +41,14 @@ def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid chart_requests JSON: {str(exc)}",
-        ) from exc
+        # Support lenient payloads that use single quotes, commonly produced by low-code tools.
+        try:
+            parsed = ast.literal_eval(raw)
+        except (ValueError, SyntaxError) as fallback_exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid chart_requests JSON: {str(exc)}",
+            ) from fallback_exc
 
     if isinstance(parsed, dict):
         return [parsed]
@@ -55,11 +61,49 @@ def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]
     )
 
 
+def _normalize_base_url(raw_url: str) -> str:
+    return raw_url.rstrip("/")
+
+
+def _resolve_public_base_url(request: Request) -> str:
+    env_base_url = os.getenv("BASE_URL", "").strip()
+    if env_base_url:
+        return _normalize_base_url(env_base_url)
+
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_proto and forwarded_host:
+        return _normalize_base_url(f"{forwarded_proto}://{forwarded_host}")
+
+    return _normalize_base_url(str(request.base_url))
+
+
+def _enrich_chart_urls(
+    charts: list[dict[str, Any]],
+    public_base_url: str | None,
+) -> list[dict[str, Any]]:
+    enriched_charts: list[dict[str, Any]] = []
+    for chart in charts:
+        item = dict(chart)
+        path = item.get("path")
+        if isinstance(path, str) and path:
+            if path.startswith("http://") or path.startswith("https://"):
+                item["image_url"] = path
+            elif public_base_url:
+                normalized_path = path if path.startswith("/") else f"/{path}"
+                item["image_url"] = f"{public_base_url}{normalized_path}"
+            else:
+                item["image_url"] = path
+        enriched_charts.append(item)
+    return enriched_charts
+
+
 def _build_analysis_payload(
     df: pd.DataFrame,
     filename: str | None = None,
-    status: str | None = None,
+    status: str | None = "success",
     chart_requests: list[dict[str, Any]] | None = None,
+    public_base_url: str | None = None,
 ) -> dict[str, Any]:
     profile_result = profile_dataframe(df)
 
@@ -72,19 +116,21 @@ def _build_analysis_payload(
     top_k = compute_top_k(enriched_df, enriched_column_map, metric="revenue", k=10)
     grouped_aggregations = compute_grouped_aggregations(enriched_df, enriched_column_map)
     data_quality = assess_data_quality(enriched_df, enriched_column_map)
-    summary_for_user = build_summary_for_user(
+    summary_details = build_summary_for_user(
         profile=profile_result,
         top_k=top_k,
         grouped_aggregations=grouped_aggregations,
         data_quality=data_quality,
         column_map=enriched_column_map,
     )
+    summary_for_user = build_summary_for_user_text(summary_details)
 
     charts = generate_charts(
         enriched_df,
         column_map=enriched_column_map,
         chart_requests=chart_requests,
     )
+    charts = _enrich_chart_urls(charts, public_base_url=public_base_url)
     insights = [
         f"The dataset contains {enriched_df.shape[0]} rows and {enriched_df.shape[1]} columns.",
         f"There are {len(profile_result['numeric_columns'])} numeric columns and {len(profile_result['categorical_columns'])} categorical columns.",
@@ -102,6 +148,7 @@ def _build_analysis_payload(
         grouped_aggregations=grouped_aggregations,
         data_quality=data_quality,
         summary_for_user=summary_for_user,
+        summary_for_user_details=summary_details,
     )
     return _model_to_dict(payload)
 
@@ -157,17 +204,21 @@ async def profile(file: UploadFile = File(...)):
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
+    request: Request,
     file: UploadFile = File(...),
     chart_requests: str | None = Form(None),
 ):
     try:
         file_bytes = await file.read()
         df = load_dataframe(file.filename, file_bytes)
-        parsed_chart_requests = _parse_chart_requests(chart_requests)
+        raw_chart_requests = chart_requests or request.query_params.get("chart_requests")
+        parsed_chart_requests = _parse_chart_requests(raw_chart_requests)
+        public_base_url = _resolve_public_base_url(request)
         return _build_analysis_payload(
             df,
             filename=file.filename,
             chart_requests=parsed_chart_requests,
+            public_base_url=public_base_url,
         )
 
     except HTTPException:
@@ -196,11 +247,18 @@ async def analyze_binary(request: Request, chart_requests: str | None = None):
         print(text[:200])
 
         df = pd.read_csv(BytesIO(file_bytes))
-        parsed_chart_requests = _parse_chart_requests(chart_requests)
+        raw_chart_requests = (
+            chart_requests
+            or request.query_params.get("chart_requests")
+            or request.headers.get("x-chart-requests")
+        )
+        parsed_chart_requests = _parse_chart_requests(raw_chart_requests)
+        public_base_url = _resolve_public_base_url(request)
         return _build_analysis_payload(
             df,
             status="success",
             chart_requests=parsed_chart_requests,
+            public_base_url=public_base_url,
         )
 
     except HTTPException:

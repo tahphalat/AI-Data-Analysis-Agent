@@ -15,4 +15,5 @@ class AnalyzeResponse(BaseModel):
     top_k: dict[str, Any] = Field(default_factory=dict)
     grouped_aggregations: dict[str, Any] = Field(default_factory=dict)
     data_quality: dict[str, Any] = Field(default_factory=dict)
-    summary_for_user: dict[str, Any] = Field(default_factory=dict)
+    summary_for_user: str = ""
+    summary_for_user_details: dict[str, Any] = Field(default_factory=dict)
