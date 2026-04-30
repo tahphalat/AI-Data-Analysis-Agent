@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 import pandas as pd
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request, Form
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.schemas.response import AnalyzeResponse
@@ -21,7 +21,6 @@ from app.services.insights import (
     build_summary_for_user as build_enriched_summary_for_user,
     build_summary_for_user_text,
 )
-from app.services.file_loader import load_dataframe
 from app.services.profiler import profile_dataframe
 from app.services.charting import generate_charts
 from app.services.validators import assess_data_quality
@@ -571,80 +570,6 @@ def health_check():
     return {"status": "ok"}
 
 
-@router.post("/upload-preview")
-async def upload_preview(file: UploadFile = File(...)):
-    try:
-        file_bytes = await file.read()
-        df = load_dataframe(file.filename, file_bytes)
-
-        return {
-            "filename": file.filename,
-            "rows": int(df.shape[0]),
-            "columns": int(df.shape[1]),
-            "column_names": df.columns.tolist(),
-            "preview": df.head(5).fillna("").to_dict(orient="records"),
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process file: {str(e)}"
-        )
-
-
-@router.post("/profile")
-async def profile(file: UploadFile = File(...)):
-    try:
-        file_bytes = await file.read()
-        df = load_dataframe(file.filename, file_bytes)
-        profile_result = profile_dataframe(df)
-
-        return {
-            "filename": file.filename,
-            "profile": profile_result,
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to profile file: {str(e)}"
-        )
-
-
-@router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(
-    request: Request,
-    file: UploadFile = File(...),
-    chart_requests: str | None = Form(None),
-):
-    try:
-        file_bytes = await file.read()
-        df = load_dataframe(file.filename, file_bytes)
-        raw_chart_requests = chart_requests or request.query_params.get("chart_requests")
-        parsed_chart_requests = _parse_chart_requests(raw_chart_requests)
-        public_base_url = _resolve_public_base_url(request)
-        return _build_analysis_payload(
-            df,
-            filename=file.filename,
-            chart_requests=parsed_chart_requests,
-            public_base_url=public_base_url,
-        )
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to analyze file: {str(e)}"
-        )
-
-
 @router.post("/analyze-binary", response_model=AnalyzeResponse)
 async def analyze_binary(request: Request, chart_requests: str | None = None):
     try:
@@ -652,12 +577,6 @@ async def analyze_binary(request: Request, chart_requests: str | None = None):
 
         if not file_bytes:
             raise ValueError("Empty request body")
-
-        text = file_bytes.decode("utf-8", errors="replace")
-
-        # debug ดู 200 ตัวแรก
-        print("DEBUG first 200 chars:")
-        print(text[:200])
 
         df = _load_binary_dataframe(file_bytes)
         dataset_id = str(uuid.uuid4())

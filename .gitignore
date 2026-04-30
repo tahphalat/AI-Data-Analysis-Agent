@@ -38,3 +38,7 @@ dist/
 
 # Logs
 *.log
+
+# Generated chart images
+analysis_service/static/charts/*
+!analysis_service/static/charts/.gitkeep
