@@ -1,6 +1,15 @@
-import pandas as pd
+import asyncio
 
-from app.routes.analyze import answer_follow_up_question
+import pandas as pd
+from starlette.requests import Request
+
+from app.routes.analyze import (
+    ANALYSIS_STORE,
+    DATASET_STORE,
+    FollowUpRequest,
+    answer_follow_up_question,
+    follow_up,
+)
 from app.services import charting
 from app.services.profiler import profile_dataframe
 
@@ -163,3 +172,41 @@ def test_follow_up_rows_and_columns_falls_back_to_dataframe_shape() -> None:
     )
 
     assert answer == "Dataset นี้มีทั้งหมด 6 rows และ 4 columns."
+
+
+def test_follow_up_chart_request_uses_cached_dataset(monkeypatch) -> None:
+    monkeypatch.setattr(charting, "_save_figure", _fake_save_figure)
+    dataset_id = "cached-iris"
+    DATASET_STORE[dataset_id] = _iris_like_df()
+    ANALYSIS_STORE[dataset_id] = {}
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/follow-up",
+            "headers": [],
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+        }
+    )
+
+    try:
+        response = asyncio.run(
+            follow_up(
+                FollowUpRequest(
+                    dataset_id=dataset_id,
+                    question="ขอสร้างกราฟ species ให้หน่อย",
+                ),
+                request,
+            )
+        )
+    finally:
+        DATASET_STORE.pop(dataset_id, None)
+        ANALYSIS_STORE.pop(dataset_id, None)
+
+    assert response["success"] is True
+    assert response["answer"] == "สร้างกราฟจาก dataset เดิมให้แล้ว"
+    assert response["chart_urls"] == ["http://testserver/test/bar.png"]
+    assert response["chart_urls_text"] == "http://testserver/test/bar.png"
+    assert response["used_cached_dataset"] is True

@@ -87,7 +87,10 @@ def _mentioned_columns(df: pd.DataFrame, question: str) -> list[str]:
         normalized_column = _normalize_for_match(column_text)
         if not normalized_column:
             continue
-        if column_text.lower() in question_lower or normalized_column in normalized_question:
+        if (
+            column_text.lower() in question_lower
+            or normalized_column.lower() in normalized_question
+        ):
             matches.append(column)
 
     return matches
@@ -389,21 +392,35 @@ def answer_follow_up_question(
     )
 
 
+FOLLOW_UP_CHART_KEYWORDS = [
+    "chart",
+    "graph",
+    "plot",
+    "visualize",
+    "visualization",
+    "bar chart",
+    "histogram",
+    "scatter",
+    "line chart",
+    "pie chart",
+    "กราฟ",
+    "แผนภูมิ",
+    "พล็อต",
+    "วาดกราฟ",
+    "สร้างกราฟ",
+]
+
+
+def _is_follow_up_chart_request(question: str) -> bool:
+    question_lower = question.lower()
+    return any(keyword in question_lower for keyword in FOLLOW_UP_CHART_KEYWORDS)
+
+
 def _build_follow_up_chart_requests(
     df: pd.DataFrame, question: str
 ) -> list[dict[str, Any]]:
     question_lower = question.lower()
-    create_chart_keywords = [
-        "create chart",
-        "show chart",
-        "plot",
-        "bar chart",
-        "histogram",
-        "scatter",
-        "สร้างกราฟ",
-        "ขอกราฟ",
-    ]
-    if not any(keyword in question_lower for keyword in create_chart_keywords):
+    if not _is_follow_up_chart_request(question):
         return []
 
     mentioned_columns = _mentioned_columns(df, question)
@@ -416,14 +433,33 @@ def _build_follow_up_chart_requests(
 
     if "scatter" in question_lower and len(numeric_columns) >= 2:
         return [{"type": "scatter", "x": numeric_columns[0], "y": numeric_columns[1]}]
+    if ("line" in question_lower or "เส้น" in question_lower) and len(mentioned_columns) >= 2:
+        return [
+            {
+                "type": "line",
+                "group_by": mentioned_columns[0],
+                "metric": mentioned_columns[1],
+            }
+        ]
     if "histogram" in question_lower and numeric_columns:
         return [{"type": "histogram", "column": numeric_columns[0]}]
+    if ("pie" in question_lower or "วงกลม" in question_lower) and categorical_columns:
+        return [{"type": "pie", "group_by": categorical_columns[0], "agg": "count"}]
+    if ("bar" in question_lower or "แท่ง" in question_lower) and categorical_columns:
+        return [{"type": "bar", "group_by": categorical_columns[0], "agg": "count"}]
     if categorical_columns:
-        return [{"type": "bar", "group_by": categorical_columns[0]}]
+        return [{"type": "bar", "group_by": categorical_columns[0], "agg": "count"}]
     if numeric_columns:
         return [{"type": "histogram", "column": numeric_columns[0]}]
 
     return []
+
+
+def _prepare_follow_up_chart_data(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    business_columns = infer_business_columns(df)
+    return ensure_revenue_column(df, business_columns)
 
 
 def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]] | None:
@@ -636,19 +672,30 @@ async def follow_up(payload: FollowUpRequest, request: Request):
             request_analysis = {}
         stored_analysis = ANALYSIS_STORE.get(dataset_id) or {}
         saved_analysis = {**request_analysis, **stored_analysis}
-        answer = answer_follow_up_question(df, question, saved_analysis)
 
         charts: list[dict[str, Any]] = []
-        chart_requests = _build_follow_up_chart_requests(df, question)
-        if chart_requests:
-            charts = generate_charts(df, column_map={}, chart_requests=chart_requests)
+        chart_urls: list[str] = []
+        if _is_follow_up_chart_request(question):
+            chart_df, chart_column_map = _prepare_follow_up_chart_data(df)
+            chart_requests = _build_follow_up_chart_requests(chart_df, question)
+            charts = generate_charts(
+                chart_df,
+                column_map=chart_column_map,
+                chart_requests=chart_requests or None,
+            )
             charts = _enrich_chart_urls(
                 charts, public_base_url=_resolve_public_base_url(request)
             )
-
-        chart_urls = _chart_urls_from_charts(charts)
-        if chart_urls:
-            answer = f"{answer}\n\nGenerated {len(chart_urls)} chart(s) from the cached dataset."
+            chart_urls = _chart_urls_from_charts(charts)
+            if chart_urls:
+                answer = "สร้างกราฟจาก dataset เดิมให้แล้ว"
+            else:
+                answer = (
+                    "ยังสร้างกราฟจากคำถามนี้ไม่ได้ "
+                    "กรุณาระบุ column หรือชนิดกราฟ เช่น bar chart, pie chart, histogram, scatter, line chart."
+                )
+        else:
+            answer = answer_follow_up_question(df, question, saved_analysis)
 
         return {
             "success": True,
