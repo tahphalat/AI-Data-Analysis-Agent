@@ -1,5 +1,6 @@
 import pandas as pd
 
+from app.routes.analyze import answer_follow_up_question
 from app.services import charting
 from app.services.profiler import profile_dataframe
 
@@ -135,3 +136,30 @@ def test_explicit_sequence_scatter_uses_row_order_for_id(monkeypatch) -> None:
     assert chart["x_column"] == "__row_index"
     assert chart["y_column"] == "Id"
     assert chart["rows"][0] == {"x": 0, "y": 1}
+
+
+def test_follow_up_rows_and_columns_uses_saved_summary() -> None:
+    df = _iris_like_df()
+    saved_analysis = {
+        "summary_for_user": "Dataset has 10,000 rows and 14 columns."
+    }
+
+    answer = answer_follow_up_question(
+        df,
+        "Dataset นี้มีกี่ rows และกี่ columns?",
+        saved_analysis,
+    )
+
+    assert answer == "Dataset has 10,000 rows and 14 columns."
+
+
+def test_follow_up_rows_and_columns_falls_back_to_dataframe_shape() -> None:
+    df = _iris_like_df()
+
+    answer = answer_follow_up_question(
+        df,
+        "ข้อมูลนี้มีกี่แถวและกี่คอลัมน์",
+        {},
+    )
+
+    assert answer == "Dataset นี้มีทั้งหมด 6 rows และ 4 columns."

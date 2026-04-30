@@ -249,6 +249,33 @@ def _format_chart_explanation(saved_analysis: dict[str, Any]) -> str:
     return "No saved chart metadata is available for this dataset yet."
 
 
+def _saved_summary_text(saved_analysis: dict[str, Any]) -> str:
+    summary_for_user = saved_analysis.get("summary_for_user")
+    if summary_for_user:
+        return str(summary_for_user)
+
+    return ""
+
+
+def _question_mentions_rows_and_columns(question_lower: str) -> bool:
+    row_terms = ["row", "rows", "แถว"]
+    column_terms = ["column", "columns", "คอลัมน์"]
+    return any(term in question_lower for term in row_terms) and any(
+        term in question_lower for term in column_terms
+    )
+
+
+def _format_dataset_shape_answer(
+    df: pd.DataFrame,
+    saved_analysis: dict[str, Any],
+) -> str:
+    summary_text = _saved_summary_text(saved_analysis)
+    if summary_text:
+        return summary_text
+
+    return f"Dataset นี้มีทั้งหมด {df.shape[0]:,} rows และ {df.shape[1]:,} columns."
+
+
 def answer_follow_up_question(
     df: pd.DataFrame,
     question: str,
@@ -264,12 +291,15 @@ def answer_follow_up_question(
             "duplicates, value counts, numeric summary, insights, or charts."
         )
 
+    if _question_mentions_rows_and_columns(question_lower):
+        return _format_dataset_shape_answer(df, saved_analysis)
+
     summary_keywords = ["summary", "summarize", "insight", "insights", "overview", "สรุป"]
     if any(keyword in question_lower for keyword in summary_keywords):
         lines: list[str] = []
-        summary_for_user = saved_analysis.get("summary_for_user")
+        summary_for_user = _saved_summary_text(saved_analysis)
         if summary_for_user:
-            lines.append(str(summary_for_user))
+            lines.append(summary_for_user)
         insights = saved_analysis.get("insights") or []
         if insights:
             lines.append("Insights:")
@@ -677,12 +707,16 @@ async def follow_up(payload: FollowUpRequest, request: Request):
 
     try:
         df = DATASET_STORE[dataset_id]
-        request_analysis = (
-            payload.analysis_result
-            if isinstance(payload.analysis_result, dict)
-            else {}
-        )
-        saved_analysis = ANALYSIS_STORE.get(dataset_id) or request_analysis or {}
+        if isinstance(payload.analysis_result, dict):
+            request_analysis = dict(payload.analysis_result)
+        elif isinstance(
+            payload.analysis_result, str
+        ) and payload.analysis_result.strip():
+            request_analysis = {"summary_for_user": payload.analysis_result.strip()}
+        else:
+            request_analysis = {}
+        stored_analysis = ANALYSIS_STORE.get(dataset_id) or {}
+        saved_analysis = {**request_analysis, **stored_analysis}
         answer = answer_follow_up_question(df, question, saved_analysis)
 
         charts: list[dict[str, Any]] = []
