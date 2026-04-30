@@ -124,3 +124,24 @@ def build_summary_for_user(
         "data_quality_notes": quality_notes,
         "recommended_next_questions": recommended_next_questions,
     }
+
+
+def build_summary_for_user_text(summary_payload: dict[str, Any]) -> str:
+    if not summary_payload:
+        return "Analysis completed."
+
+    lines: list[str] = []
+    headline = summary_payload.get("headline")
+    if headline:
+        lines.append(str(headline))
+
+    for highlight in summary_payload.get("highlights", [])[:4]:
+        lines.append(str(highlight))
+
+    quality_notes = summary_payload.get("data_quality_notes", [])
+    if quality_notes:
+        lines.append(str(quality_notes[0]))
+
+    if not lines:
+        return "Analysis completed."
+    return " ".join(lines)
