@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from app.services.aggregations import COLUMN_CANDIDATES, coerce_numeric_series
-from app.services.profiler import infer_semantic_columns
+from app.services.profiler import infer_semantic_profile
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -126,14 +126,38 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
+def _semantic_profile(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    return infer_semantic_profile(df)
+
+
 def _semantic_columns(df: pd.DataFrame) -> dict[str, str]:
-    return infer_semantic_columns(df)
+    return {
+        column: profile["type"]
+        for column, profile in _semantic_profile(df).items()
+    }
+
+
+def _semantic_entry(df: pd.DataFrame, column: str | None) -> dict[str, Any]:
+    if not column or column == ROW_INDEX_COLUMN:
+        return {"type": "derived_metric", "confidence": 1.0, "reasons": []}
+    return _semantic_profile(df).get(
+        column,
+        {"type": "unknown", "confidence": 0.0, "reasons": ["column was not profiled"]},
+    )
 
 
 def _is_identifier_column(df: pd.DataFrame, column: str | None) -> bool:
-    if not column or column == ROW_INDEX_COLUMN:
-        return False
-    return _semantic_columns(df).get(column) == "identifier"
+    return _semantic_entry(df, column).get("type") == "identifier"
+
+
+def _low_confidence_warning(df: pd.DataFrame, column: str | None) -> list[str]:
+    entry = _semantic_entry(df, column)
+    confidence = float(entry.get("confidence", 0.0))
+    if column and column != ROW_INDEX_COLUMN and confidence < 0.7:
+        return [
+            f"Semantic type for {column} is low confidence ({confidence:.2f}); chart choice may need review."
+        ]
+    return []
 
 
 def _request_intent(request: dict[str, Any]) -> str:
@@ -240,6 +264,10 @@ def _generate_grouped_bar_or_pie(
         if metric_col
         else f"Selected {chart_type} chart to show record counts by {group_col}."
     )
+    warnings = [
+        *_low_confidence_warning(df, group_col),
+        *_low_confidence_warning(df, metric_col),
+    ]
     return _with_chart_metadata({
         "type": chart_type,
         "title": title,
@@ -248,7 +276,7 @@ def _generate_grouped_bar_or_pie(
         "agg": str(agg_name).lower(),
         "path": chart_path,
         "rows": rows,
-    }, reason)
+    }, reason, warnings)
 
 
 def _generate_histogram(
@@ -291,7 +319,7 @@ def _generate_histogram(
     ax.set_ylabel("Frequency")
 
     chart_path = _save_figure(fig, "hist")
-    warnings = []
+    warnings = _low_confidence_warning(df, metric_col)
     if _is_identifier_column(df, metric_col):
         warnings.append(
             f"{metric_col} appears to be an identifier; use this histogram only as a frequency check."
@@ -360,7 +388,7 @@ def _generate_sequence_chart(
         for _, row in working.iterrows()
     ]
 
-    warnings = []
+    warnings = _low_confidence_warning(df, y_col)
     if _is_identifier_column(df, y_col):
         warnings.append(
             f"{y_col} appears to be an identifier; this chart shows sequence/order, not a numeric distribution."
@@ -484,6 +512,10 @@ def _generate_line(
         {"x": _to_json_value(x_val), "value": _to_json_value(y_val)}
         for x_val, y_val in zip(x_values, y_values)
     ]
+    warnings = [
+        *_low_confidence_warning(df, group_col),
+        *_low_confidence_warning(df, metric_col),
+    ]
     return _with_chart_metadata({
         "type": "line",
         "title": title,
@@ -492,7 +524,7 @@ def _generate_line(
         "agg": str(agg_name).lower(),
         "path": chart_path,
         "rows": rows,
-    }, f"Selected line chart to show {str(agg_name).lower()} trend by {group_col}.")
+    }, f"Selected line chart to show {str(agg_name).lower()} trend by {group_col}.", warnings)
 
 
 def _generate_chart_from_request(
@@ -623,7 +655,7 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
     semantic_columns = _semantic_columns(df)
     numeric_cols = [
         col for col in df.select_dtypes(include="number").columns.tolist()
-        if semantic_columns.get(col) in {"numeric_feature", "derived_metric"}
+        if semantic_columns.get(col) in {"numeric_feature", "measure", "derived_metric"}
     ]
     skipped_identifier_cols = [
         col for col, semantic_type in semantic_columns.items()
@@ -645,7 +677,7 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
                 "column": col,
                 "title": f"Distribution of {col}",
                 "path": chart_path,
-            }, f"Selected histogram because {col} is a numeric feature.")
+            }, f"Selected histogram because {col} is a {semantic_columns.get(col)} column.", _low_confidence_warning(df, col))
         )
 
     if categorical_cols:
@@ -670,7 +702,7 @@ def generate_basic_charts(df: pd.DataFrame) -> list[dict]:
                     {"group": _to_json_value(label), "value": _to_json_value(value)}
                     for label, value in value_counts.items()
                 ],
-            }, f"Selected bar chart to show record counts by categorical column {col}.")
+            }, f"Selected bar chart to show record counts by categorical column {col}.", _low_confidence_warning(df, col))
         )
 
     if skipped_identifier_cols and charts:
