@@ -2,15 +2,14 @@ from io import BytesIO
 import ast
 import json
 import os
-import uuid
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
 
 from app.schemas.response import AnalyzeResponse
 from app.services.aggregations import (
+    compute_generic_grouped_statistics,
     compute_grouped_aggregations,
     compute_row_level_extremes,
     compute_top_k,
@@ -27,39 +26,11 @@ from app.services.validators import assess_data_quality
 
 router = APIRouter()
 
-# MVP/demo storage only. These in-memory stores reset whenever the backend process restarts.
-DATASET_STORE: dict[str, pd.DataFrame] = {}
-ANALYSIS_STORE: dict[str, dict[str, Any]] = {}
-
-
-class FollowUpRequest(BaseModel):
-    dataset_id: str = Field(default="")
-    question: str = Field(default="")
-    analysis_result: Any | None = None
-
 
 def _model_to_dict(model: AnalyzeResponse) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_none=True)
     return model.dict(exclude_none=True)
-
-
-def _format_value(value: Any) -> str:
-    if value is None:
-        return "N/A"
-    try:
-        if pd.isna(value):
-            return "N/A"
-    except (TypeError, ValueError):
-        pass
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-    if isinstance(value, float):
-        return f"{value:,.4g}"
-    return str(value)
 
 
 def _format_number(value: Any) -> str:
@@ -77,31 +48,6 @@ def _normalize_for_match(value: object) -> str:
     return "".join(ch.lower() for ch in str(value) if ch.isalnum())
 
 
-def _mentioned_columns(df: pd.DataFrame, question: str) -> list[str]:
-    question_lower = question.lower()
-    normalized_question = _normalize_for_match(question)
-    matches: list[str] = []
-
-    for column in sorted(df.columns.tolist(), key=lambda item: len(str(item)), reverse=True):
-        column_text = str(column).strip()
-        normalized_column = _normalize_for_match(column_text)
-        if not normalized_column:
-            continue
-        if (
-            column_text.lower() in question_lower
-            or normalized_column.lower() in normalized_question
-        ):
-            matches.append(column)
-
-    return matches
-
-
-def _is_categorical_like(series: pd.Series) -> bool:
-    non_null = series.dropna()
-    unique_count = int(non_null.nunique(dropna=True)) if not non_null.empty else 0
-    return series.dtype.kind not in {"i", "u", "f"} or unique_count <= 30
-
-
 def _chart_urls_from_charts(charts: list[dict[str, Any]]) -> list[str]:
     urls: list[str] = []
     for chart in charts:
@@ -113,9 +59,184 @@ def _chart_urls_from_charts(charts: list[dict[str, Any]]) -> list[str]:
     return urls
 
 
+def _chart_url(chart: dict[str, Any]) -> str:
+    image_url = chart.get("image_url")
+    path = chart.get("path")
+    url = image_url if isinstance(image_url, str) and image_url else path
+    return url if isinstance(url, str) else ""
+
+
+def _chart_columns(chart: dict[str, Any]) -> list[str]:
+    columns: list[str] = []
+    for key in (
+        "column",
+        "group_by_column",
+        "metric_column",
+        "x_column",
+        "y_column",
+    ):
+        value = chart.get(key)
+        if (
+            isinstance(value, str)
+            and value
+            and value != "__row_index"
+            and value not in columns
+        ):
+            columns.append(value)
+    return columns
+
+
+def _chart_type_label(chart_type: str) -> str:
+    labels = {
+        "bar": "Bar Chart",
+        "pie": "Pie Chart",
+        "histogram": "Histogram",
+        "hist": "Histogram",
+        "line": "Line Chart",
+        "scatter": "Scatter Plot",
+    }
+    return labels.get(chart_type.lower(), chart_type.title() if chart_type else "Chart")
+
+
+def _chart_description(chart: dict[str, Any]) -> str:
+    chart_type = str(chart.get("type", "")).lower()
+    group_col = chart.get("group_by_column")
+    metric_col = chart.get("metric_column")
+    column = chart.get("column")
+    x_col = chart.get("x_column")
+    y_col = chart.get("y_column")
+    agg = str(chart.get("agg", "")).lower()
+
+    if chart_type in {"histogram", "hist"} and column:
+        return (
+            f"กราฟนี้แสดงการกระจายตัวของค่าในคอลัมน์ {column} "
+            "ช่วยให้เห็นว่าค่าส่วนใหญ่อยู่ในช่วงใด และข้อมูลกระจายตัวมากน้อยแค่ไหน"
+        )
+    if chart_type == "bar" and group_col and metric_col:
+        return (
+            f"กราฟนี้เปรียบเทียบค่า {agg or 'metric'} ของ {metric_col} แยกตาม {group_col} "
+            "ช่วยให้เห็นว่ากลุ่มใดมีค่าสูงหรือต่ำกว่ากัน"
+        )
+    if chart_type == "bar" and group_col:
+        return (
+            f"กราฟนี้เปรียบเทียบจำนวนรายการในแต่ละค่าของ {group_col} "
+            "ช่วยให้เห็นว่ากลุ่มใดมีจำนวนมากหรือน้อยกว่ากัน"
+        )
+    if chart_type == "pie" and group_col and metric_col:
+        return (
+            f"กราฟนี้แสดงสัดส่วน {agg or 'metric'} ของ {metric_col} แยกตาม {group_col} "
+            "ช่วยให้เห็นว่าส่วนแบ่งของแต่ละกลุ่มเป็นเท่าไร"
+        )
+    if chart_type == "pie" and group_col:
+        return (
+            f"กราฟนี้แสดงสัดส่วนจำนวนรายการในแต่ละค่าของ {group_col} "
+            "ช่วยให้เห็นว่าสัดส่วนของแต่ละกลุ่มแตกต่างกันอย่างไร"
+        )
+    if chart_type == "line" and group_col:
+        target = metric_col or chart.get("y_column") or "value"
+        return (
+            f"กราฟนี้แสดงแนวโน้มของ {target} ตาม {group_col} "
+            "ช่วยให้เห็นการเปลี่ยนแปลงของข้อมูลตามลำดับหรือเวลา"
+        )
+    if chart_type == "scatter" and y_col:
+        x_label = "ลำดับแถว" if x_col == "__row_index" else x_col
+        return (
+            f"กราฟนี้แสดงความสัมพันธ์ระหว่าง {x_label} และ {y_col} "
+            "ช่วยให้เห็นรูปแบบการกระจายของจุดข้อมูล"
+        )
+
+    return chart.get("selection_reason") or "กราฟนี้สร้างจาก dataset ที่ส่งเข้า backend"
+
+
+def _build_chart_metadata(charts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    metadata: list[dict[str, Any]] = []
+    for index, chart in enumerate(charts, start=1):
+        chart_type = str(chart.get("type", "chart"))
+        url = _chart_url(chart)
+        if chart_type == "error" or not url:
+            continue
+        metadata.append(
+            {
+                "title": str(chart.get("title") or f"Chart {index}"),
+                "chart_type": _chart_type_label(chart_type),
+                "columns": _chart_columns(chart),
+                "description": _chart_description(chart),
+                "url": url,
+            }
+        )
+    return metadata
+
+
+def _build_chart_markdown(chart_metadata: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for chart in chart_metadata:
+        title = chart.get("title") or "Chart"
+        chart_type = chart.get("chart_type") or "Chart"
+        url = chart.get("url") or ""
+        if url:
+            lines.append(f"- [{title} ({chart_type})]({url})")
+    return "\n".join(lines)
+
+
+def _build_analysis_result_context(
+    *,
+    summary_for_user: str,
+    summary_for_user_details: dict[str, Any],
+    insights: list[str],
+    row_level_extremes: dict[str, Any],
+    top_k: dict[str, Any],
+    grouped_aggregations: dict[str, Any],
+    generic_grouped_statistics: dict[str, Any],
+    data_quality: dict[str, Any],
+    chart_metadata: list[dict[str, Any]],
+    chart_markdown: str,
+) -> dict[str, Any]:
+    return {
+        "summary_for_user": summary_for_user,
+        "summary_for_user_details": summary_for_user_details,
+        "insights": insights,
+        "row_level_extremes": row_level_extremes,
+        "top_k": top_k,
+        "grouped_aggregations": grouped_aggregations,
+        "generic_grouped_statistics": generic_grouped_statistics,
+        "data_quality": data_quality,
+        "chart_metadata": chart_metadata,
+        "chart_markdown": chart_markdown,
+    }
+
+
+def _build_grouped_aggregation_insights(
+    grouped_aggregations: dict[str, Any],
+    max_items: int = 5,
+) -> list[str]:
+    insights: list[str] = []
+    for section in grouped_aggregations.values():
+        group_column = section.get("group_by_column")
+        top_by_mean = section.get("top_by_mean", {})
+        if not group_column or not isinstance(top_by_mean, dict):
+            continue
+
+        for metric_column, top_row in top_by_mean.items():
+            if not isinstance(top_row, dict):
+                continue
+            group_value = top_row.get(group_column)
+            mean_value = top_row.get("mean")
+            if group_value is None or mean_value is None:
+                continue
+            insights.append(
+                f"For {group_column}, {group_value} has the highest average {metric_column} "
+                f"at {_format_number(mean_value)}."
+            )
+            if len(insights) >= max_items:
+                return insights
+    return insights
+
+
 def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
     missing_values = {str(col): int(count) for col, count in df.isna().sum().items()}
-    numeric_columns = [str(col) for col in df.select_dtypes(include="number").columns.tolist()]
+    numeric_columns = [
+        str(col) for col in df.select_dtypes(include="number").columns.tolist()
+    ]
     categorical_columns = [
         str(col) for col in df.select_dtypes(exclude="number").columns.tolist()
     ]
@@ -184,284 +305,6 @@ def _load_binary_dataframe(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_csv(BytesIO(file_bytes))
 
 
-def _format_missing_values(df: pd.DataFrame) -> str:
-    missing_counts = {str(col): int(count) for col, count in df.isna().sum().items()}
-    missing_columns = {
-        col: count for col, count in missing_counts.items() if count > 0
-    }
-    if not missing_columns:
-        return "No missing values were found in the cached dataset."
-
-    lines = ["Missing values by column:"]
-    lines.extend(f"- {col}: {count}" for col, count in missing_columns.items())
-    lines.append(f"Total missing values: {sum(missing_counts.values())}")
-    return "\n".join(lines)
-
-
-def _format_value_counts(df: pd.DataFrame, column: str) -> str:
-    counts = df[column].value_counts(dropna=False).head(20)
-    lines = [f"Value counts for {column}:"]
-    lines.extend(
-        f"- {_format_value(index)}: {int(value)}" for index, value in counts.items()
-    )
-    unique_count = int(df[column].nunique(dropna=True))
-    if unique_count > 20:
-        lines.append(f"Showing top 20 of {unique_count} unique non-empty values.")
-    return "\n".join(lines)
-
-
-def _format_numeric_summary(df: pd.DataFrame, column: str) -> str:
-    values = pd.to_numeric(df[column], errors="coerce").dropna()
-    if values.empty:
-        return f"{column} does not contain numeric values that can be summarized."
-
-    return "\n".join(
-        [
-            f"Numeric summary for {column}:",
-            f"- count: {int(values.count())}",
-            f"- mean: {_format_number(values.mean())}",
-            f"- min: {_format_number(values.min())}",
-            f"- max: {_format_number(values.max())}",
-            f"- median: {_format_number(values.median())}",
-            f"- standard deviation: {_format_number(values.std())}",
-        ]
-    )
-
-
-def _format_chart_explanation(saved_analysis: dict[str, Any]) -> str:
-    charts = saved_analysis.get("charts") or []
-    if charts:
-        lines = ["Available chart explanation:"]
-        for index, chart in enumerate(charts[:5], start=1):
-            title = chart.get("title") or chart.get("type") or f"chart {index}"
-            reason = chart.get("selection_reason") or "This chart was generated from the uploaded dataset."
-            lines.append(f"- {title}: {reason}")
-            warnings = chart.get("warnings") or []
-            if warnings:
-                lines.append(f"  Note: {warnings[0]}")
-        return "\n".join(lines)
-
-    chart_urls = saved_analysis.get("chart_urls") or []
-    if chart_urls:
-        return (
-            "The saved analysis has chart image URLs, but no detailed chart metadata. "
-            "I can confirm the charts were generated from the cached dataset, but I will not invent exact values without metadata."
-        )
-
-    return "No saved chart metadata is available for this dataset yet."
-
-
-def _saved_summary_text(saved_analysis: dict[str, Any]) -> str:
-    summary_for_user = saved_analysis.get("summary_for_user")
-    if summary_for_user:
-        return str(summary_for_user)
-
-    return ""
-
-
-def _question_mentions_rows_and_columns(question_lower: str) -> bool:
-    row_terms = ["row", "rows", "แถว"]
-    column_terms = ["column", "columns", "คอลัมน์"]
-    return any(term in question_lower for term in row_terms) and any(
-        term in question_lower for term in column_terms
-    )
-
-
-def _format_dataset_shape_answer(
-    df: pd.DataFrame,
-    saved_analysis: dict[str, Any],
-) -> str:
-    summary_text = _saved_summary_text(saved_analysis)
-    if summary_text:
-        return summary_text
-
-    return f"Dataset นี้มีทั้งหมด {df.shape[0]:,} rows และ {df.shape[1]:,} columns."
-
-
-def answer_follow_up_question(
-    df: pd.DataFrame,
-    question: str,
-    saved_analysis: dict[str, Any],
-) -> str:
-    question = (question or "").strip()
-    question_lower = question.lower()
-    mentioned_columns = _mentioned_columns(df, question)
-
-    if not question:
-        return (
-            "Please send a follow-up question about rows, columns, missing values, "
-            "duplicates, value counts, numeric summary, insights, or charts."
-        )
-
-    if _question_mentions_rows_and_columns(question_lower):
-        return _format_dataset_shape_answer(df, saved_analysis)
-
-    summary_keywords = ["summary", "summarize", "insight", "insights", "overview", "สรุป"]
-    if any(keyword in question_lower for keyword in summary_keywords):
-        lines: list[str] = []
-        summary_for_user = _saved_summary_text(saved_analysis)
-        if summary_for_user:
-            lines.append(summary_for_user)
-        insights = saved_analysis.get("insights") or []
-        if insights:
-            lines.append("Insights:")
-            lines.extend(f"- {insight}" for insight in insights[:5])
-        return "\n".join(lines) if lines else build_summary_for_user(
-            build_dataset_profile(df), build_data_quality(df)
-        )
-
-    chart_keywords = ["explain chart", "chart meaning", "กราฟหมายความว่าอะไร"]
-    if any(keyword in question_lower for keyword in chart_keywords):
-        return _format_chart_explanation(saved_analysis)
-
-    row_keywords = ["how many rows", "number of rows", "row count", "มีกี่แถว"]
-    column_count_keywords = [
-        "how many columns",
-        "number of columns",
-        "column count",
-        "มีกี่ column",
-        "มีกี่คอลัมน์",
-    ]
-    if any(keyword in question_lower for keyword in row_keywords):
-        return f"The cached dataset has {df.shape[0]:,} rows and {df.shape[1]:,} columns."
-    if any(keyword in question_lower for keyword in column_count_keywords):
-        return f"The cached dataset has {df.shape[1]:,} columns and {df.shape[0]:,} rows."
-
-    missing_keywords = ["missing", "null", "nan", "ค่าว่าง", "ค่าสูญหาย"]
-    if any(keyword in question_lower for keyword in missing_keywords):
-        return _format_missing_values(df)
-
-    duplicate_keywords = ["duplicate", "duplicated", "ข้อมูลซ้ำ", "ซ้ำ"]
-    if any(keyword in question_lower for keyword in duplicate_keywords):
-        duplicate_rows = int(df.duplicated().sum())
-        return f"The cached dataset has {duplicate_rows:,} duplicate rows."
-
-    column_list_keywords = [
-        "what columns",
-        "column names",
-        "list columns",
-        "columns are in",
-        "มี column อะไร",
-        "มีคอลัมน์อะไร",
-    ]
-    if any(keyword in question_lower for keyword in column_list_keywords):
-        return "Columns in this dataset: " + ", ".join(str(col) for col in df.columns)
-
-    value_count_keywords = [
-        "value count",
-        "value counts",
-        "count by",
-        "แต่ละประเภท",
-        "แต่ละกลุ่ม",
-        "จำนวนเท่าไหร่",
-    ]
-    numeric_summary_keywords = [
-        "mean",
-        "average",
-        "median",
-        "min",
-        "max",
-        "standard deviation",
-        "std",
-        "summary statistics",
-        "สถิติ",
-        "ค่าเฉลี่ย",
-    ]
-
-    for column in mentioned_columns:
-        series = df[column]
-        is_numeric = series.dtype.kind in {"i", "u", "f"}
-        wants_value_counts = any(
-            keyword in question_lower for keyword in value_count_keywords
-        )
-        wants_numeric_summary = any(
-            keyword in question_lower for keyword in numeric_summary_keywords
-        )
-
-        if is_numeric and (wants_numeric_summary or not wants_value_counts):
-            return _format_numeric_summary(df, column)
-        if _is_categorical_like(series):
-            return _format_value_counts(df, column)
-        if is_numeric:
-            return _format_numeric_summary(df, column)
-
-    return (
-        "The backend MVP cannot fully interpret this follow-up yet. "
-        "Please ask about row count, column names, missing values, duplicate rows, "
-        "value counts for a column, or a numeric summary for a column."
-    )
-
-
-FOLLOW_UP_CHART_KEYWORDS = [
-    "chart",
-    "graph",
-    "plot",
-    "visualize",
-    "visualization",
-    "bar chart",
-    "histogram",
-    "scatter",
-    "line chart",
-    "pie chart",
-    "กราฟ",
-    "แผนภูมิ",
-    "พล็อต",
-    "วาดกราฟ",
-    "สร้างกราฟ",
-]
-
-
-def _is_follow_up_chart_request(question: str) -> bool:
-    question_lower = question.lower()
-    return any(keyword in question_lower for keyword in FOLLOW_UP_CHART_KEYWORDS)
-
-
-def _build_follow_up_chart_requests(
-    df: pd.DataFrame, question: str
-) -> list[dict[str, Any]]:
-    question_lower = question.lower()
-    if not _is_follow_up_chart_request(question):
-        return []
-
-    mentioned_columns = _mentioned_columns(df, question)
-    numeric_columns = [
-        column for column in mentioned_columns if df[column].dtype.kind in {"i", "u", "f"}
-    ]
-    categorical_columns = [
-        column for column in mentioned_columns if _is_categorical_like(df[column])
-    ]
-
-    if "scatter" in question_lower and len(numeric_columns) >= 2:
-        return [{"type": "scatter", "x": numeric_columns[0], "y": numeric_columns[1]}]
-    if ("line" in question_lower or "เส้น" in question_lower) and len(mentioned_columns) >= 2:
-        return [
-            {
-                "type": "line",
-                "group_by": mentioned_columns[0],
-                "metric": mentioned_columns[1],
-            }
-        ]
-    if "histogram" in question_lower and numeric_columns:
-        return [{"type": "histogram", "column": numeric_columns[0]}]
-    if ("pie" in question_lower or "วงกลม" in question_lower) and categorical_columns:
-        return [{"type": "pie", "group_by": categorical_columns[0], "agg": "count"}]
-    if ("bar" in question_lower or "แท่ง" in question_lower) and categorical_columns:
-        return [{"type": "bar", "group_by": categorical_columns[0], "agg": "count"}]
-    if categorical_columns:
-        return [{"type": "bar", "group_by": categorical_columns[0], "agg": "count"}]
-    if numeric_columns:
-        return [{"type": "histogram", "column": numeric_columns[0]}]
-
-    return []
-
-
-def _prepare_follow_up_chart_data(
-    df: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    business_columns = infer_business_columns(df)
-    return ensure_revenue_column(df, business_columns)
-
-
 def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]] | None:
     if raw_chart_requests is None:
         return None
@@ -473,7 +316,6 @@ def _parse_chart_requests(raw_chart_requests: str | None) -> list[dict[str, Any]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        # Support lenient payloads that use single quotes, commonly produced by low-code tools.
         try:
             parsed = ast.literal_eval(raw)
         except (ValueError, SyntaxError) as fallback_exc:
@@ -534,7 +376,6 @@ def _build_analysis_payload(
     df: pd.DataFrame,
     filename: str | None = None,
     status: str | None = "success",
-    dataset_id: str | None = None,
     chart_requests: list[dict[str, Any]] | None = None,
     public_base_url: str | None = None,
 ) -> dict[str, Any]:
@@ -552,7 +393,15 @@ def _build_analysis_payload(
         enriched_df, enriched_column_map, metrics=["revenue"]
     )
     top_k = compute_top_k(enriched_df, enriched_column_map, metric="revenue", k=10)
-    grouped_aggregations = compute_grouped_aggregations(enriched_df, enriched_column_map)
+    grouped_aggregations = compute_grouped_aggregations(
+        enriched_df,
+        enriched_column_map,
+        semantic_columns=profile_result.get("semantic_columns", {}),
+    )
+    generic_grouped_statistics = compute_generic_grouped_statistics(
+        enriched_df,
+        semantic_columns=profile_result.get("semantic_columns", {}),
+    )
     data_quality = assess_data_quality(enriched_df, enriched_column_map)
     data_quality.update(build_data_quality(enriched_df))
     enriched_summary_profile = dict(profile_result)
@@ -575,25 +424,43 @@ def _build_analysis_payload(
     )
     charts = _enrich_chart_urls(charts, public_base_url=public_base_url)
     chart_urls = _chart_urls_from_charts(charts)
+    chart_metadata = _build_chart_metadata(charts)
+    chart_markdown = _build_chart_markdown(chart_metadata)
     insights = [
         f"The dataset contains {enriched_df.shape[0]} rows and {enriched_df.shape[1]} columns.",
         f"There are {len(profile_result['numeric_columns'])} numeric columns and {len(profile_result['categorical_columns'])} categorical columns.",
         f"{len(profile_result['missing_summary'])} columns contain missing values.",
     ]
+    insights.extend(_build_grouped_aggregation_insights(grouped_aggregations))
+    analysis_result = _build_analysis_result_context(
+        summary_for_user=summary_for_user,
+        summary_for_user_details=summary_details,
+        insights=insights,
+        row_level_extremes=row_level_extremes,
+        top_k=top_k,
+        grouped_aggregations=grouped_aggregations,
+        generic_grouped_statistics=generic_grouped_statistics,
+        data_quality=data_quality,
+        chart_metadata=chart_metadata,
+        chart_markdown=chart_markdown,
+    )
 
     payload = AnalyzeResponse(
         success=True,
-        dataset_id=dataset_id,
         status=status,
         filename=filename,
         profile=profile_result,
         charts=charts,
         chart_urls=chart_urls,
         chart_urls_text="\n".join(chart_urls),
+        chart_metadata=chart_metadata,
+        chart_markdown=chart_markdown,
         insights=insights,
+        analysis_result=analysis_result,
         row_level_extremes=row_level_extremes,
         top_k=top_k,
         grouped_aggregations=grouped_aggregations,
+        generic_grouped_statistics=generic_grouped_statistics,
         data_quality=data_quality,
         summary_for_user=summary_for_user,
         summary_for_user_details=summary_details,
@@ -615,7 +482,6 @@ async def analyze_binary(request: Request, chart_requests: str | None = None):
             raise ValueError("Empty request body")
 
         df = _load_binary_dataframe(file_bytes)
-        dataset_id = str(uuid.uuid4())
         raw_chart_requests = (
             chart_requests
             or request.query_params.get("chart_requests")
@@ -623,16 +489,12 @@ async def analyze_binary(request: Request, chart_requests: str | None = None):
         )
         parsed_chart_requests = _parse_chart_requests(raw_chart_requests)
         public_base_url = _resolve_public_base_url(request)
-        analysis_result = _build_analysis_payload(
+        return _build_analysis_payload(
             df,
             status="success",
-            dataset_id=dataset_id,
             chart_requests=parsed_chart_requests,
             public_base_url=public_base_url,
         )
-        DATASET_STORE[dataset_id] = df
-        ANALYSIS_STORE[dataset_id] = analysis_result
-        return analysis_result
 
     except HTTPException:
         raise
@@ -641,76 +503,5 @@ async def analyze_binary(request: Request, chart_requests: str | None = None):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to analyze binary file: {str(e)}"
-        )
-
-
-@router.post("/follow-up")
-async def follow_up(payload: FollowUpRequest, request: Request):
-    dataset_id = payload.dataset_id.strip()
-    question = payload.question.strip()
-
-    if not dataset_id:
-        raise HTTPException(status_code=400, detail="dataset_id is required.")
-    if not question:
-        raise HTTPException(status_code=400, detail="question is required.")
-    if dataset_id not in DATASET_STORE:
-        raise HTTPException(
-            status_code=404,
-            detail="Dataset not found. Please upload the file again.",
-        )
-
-    try:
-        df = DATASET_STORE[dataset_id]
-        if isinstance(payload.analysis_result, dict):
-            request_analysis = dict(payload.analysis_result)
-        elif isinstance(
-            payload.analysis_result, str
-        ) and payload.analysis_result.strip():
-            request_analysis = {"summary_for_user": payload.analysis_result.strip()}
-        else:
-            request_analysis = {}
-        stored_analysis = ANALYSIS_STORE.get(dataset_id) or {}
-        saved_analysis = {**request_analysis, **stored_analysis}
-
-        charts: list[dict[str, Any]] = []
-        chart_urls: list[str] = []
-        if _is_follow_up_chart_request(question):
-            chart_df, chart_column_map = _prepare_follow_up_chart_data(df)
-            chart_requests = _build_follow_up_chart_requests(chart_df, question)
-            charts = generate_charts(
-                chart_df,
-                column_map=chart_column_map,
-                chart_requests=chart_requests or None,
-            )
-            charts = _enrich_chart_urls(
-                charts, public_base_url=_resolve_public_base_url(request)
-            )
-            chart_urls = _chart_urls_from_charts(charts)
-            if chart_urls:
-                answer = "สร้างกราฟจาก dataset เดิมให้แล้ว"
-            else:
-                answer = (
-                    "ยังสร้างกราฟจากคำถามนี้ไม่ได้ "
-                    "กรุณาระบุ column หรือชนิดกราฟ เช่น bar chart, pie chart, histogram, scatter, line chart."
-                )
-        else:
-            answer = answer_follow_up_question(df, question, saved_analysis)
-
-        return {
-            "success": True,
-            "dataset_id": dataset_id,
-            "question": question,
-            "answer": answer,
-            "chart_urls": chart_urls,
-            "chart_urls_text": "\n".join(chart_urls),
-            "used_cached_dataset": True,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to answer follow-up question: {str(e)}",
+            detail=f"Failed to analyze binary file: {str(e)}",
         )

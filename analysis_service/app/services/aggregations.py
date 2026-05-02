@@ -81,6 +81,147 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
+def _to_json_stat_value(value: Any) -> Any:
+    json_value = _to_json_value(value)
+    if isinstance(json_value, float):
+        return round(json_value, 6)
+    return json_value
+
+
+def _normalize_result_key(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+    return normalized or "group"
+
+
+def _is_numeric_metric_column(
+    df: pd.DataFrame,
+    column: str,
+    semantic_columns: dict[str, str],
+) -> bool:
+    if str(column).startswith("__"):
+        return False
+    if semantic_columns.get(column) == "identifier":
+        return False
+
+    series = df[column].dropna()
+    if series.empty:
+        return False
+
+    numeric_series = coerce_numeric_series(series)
+    valid_ratio = float(numeric_series.notna().sum()) / float(len(series))
+    return valid_ratio >= 0.8
+
+
+def _is_groupable_column(
+    df: pd.DataFrame,
+    column: str,
+    semantic_columns: dict[str, str],
+    max_groups: int,
+) -> bool:
+    if str(column).startswith("__"):
+        return False
+    if semantic_columns.get(column) in {"identifier", "datetime", "text"}:
+        return False
+
+    series = df[column].dropna()
+    if series.empty:
+        return False
+
+    unique_count = int(series.nunique(dropna=True))
+    if unique_count < 2 or unique_count > max_groups:
+        return False
+
+    if semantic_columns.get(column) in {"categorical", "boolean"}:
+        return True
+
+    return df[column].dtype.kind not in {"i", "u", "f"}
+
+
+def _build_generic_grouped_aggregations(
+    df: pd.DataFrame,
+    semantic_columns: dict[str, str] | None = None,
+    max_groups: int = 30,
+    max_dimensions: int = 8,
+) -> dict[str, Any]:
+    semantic_columns = semantic_columns or {}
+    metric_columns = [
+        str(column)
+        for column in df.columns
+        if _is_numeric_metric_column(df, str(column), semantic_columns)
+    ]
+    if not metric_columns:
+        return {}
+
+    group_columns = [
+        str(column)
+        for column in df.columns
+        if _is_groupable_column(df, str(column), semantic_columns, max_groups=max_groups)
+    ][:max_dimensions]
+    if not group_columns:
+        return {}
+
+    grouped_results: dict[str, Any] = {}
+    for group_column in group_columns:
+        working = df[[group_column, *metric_columns]].copy()
+        working[group_column] = working[group_column].fillna("(missing)").astype(str)
+        for metric_column in metric_columns:
+            working[metric_column] = coerce_numeric_series(working[metric_column])
+
+        rows: list[dict[str, Any]] = []
+        grouped = working.groupby(group_column, dropna=False)
+        for group_value, group_df in grouped:
+            row: dict[str, Any] = {
+                group_column: _to_json_value(group_value),
+                "row_count": int(len(group_df)),
+            }
+            for metric_column in metric_columns:
+                metric_values = group_df[metric_column].dropna()
+                metric_count = int(metric_values.count())
+                row[f"{metric_column}_count"] = metric_count
+                row[f"{metric_column}_mean"] = (
+                    _to_json_stat_value(metric_values.mean()) if metric_count else None
+                )
+                row[f"{metric_column}_sum"] = (
+                    _to_json_stat_value(metric_values.sum()) if metric_count else None
+                )
+                row[f"{metric_column}_min"] = (
+                    _to_json_stat_value(metric_values.min()) if metric_count else None
+                )
+                row[f"{metric_column}_max"] = (
+                    _to_json_stat_value(metric_values.max()) if metric_count else None
+                )
+            rows.append(row)
+
+        rows.sort(key=lambda item: int(item.get("row_count", 0)), reverse=True)
+
+        top_by_mean: dict[str, dict[str, Any]] = {}
+        for metric_column in metric_columns:
+            mean_key = f"{metric_column}_mean"
+            valid_rows = [row for row in rows if row.get(mean_key) is not None]
+            if not valid_rows:
+                continue
+            top_row = max(valid_rows, key=lambda row: float(row[mean_key]))
+            top_by_mean[metric_column] = {
+                group_column: top_row.get(group_column),
+                "mean": top_row.get(mean_key),
+                "row_count": top_row.get("row_count"),
+            }
+
+        result_key = f"by_{_normalize_result_key(group_column)}"
+        grouped_results[result_key] = {
+            "group_by_column": group_column,
+            "metric_columns": metric_columns,
+            "rows": rows,
+            "top_by_mean": top_by_mean,
+            "aggregation_note": (
+                "Generic grouped aggregation: numeric metrics are summarized by "
+                "mean, sum, min, max, and count for each group."
+            ),
+        }
+
+    return grouped_results
+
+
 def coerce_numeric_series(series: pd.Series) -> pd.Series:
     if series.dtype.kind in {"i", "u", "f"}:
         return pd.to_numeric(series, errors="coerce")
@@ -239,19 +380,23 @@ def compute_top_k(
 def compute_grouped_aggregations(
     df: pd.DataFrame,
     column_map: dict[str, Any],
+    semantic_columns: dict[str, str] | None = None,
     top_n_products: int = 15,
 ) -> dict[str, Any]:
+    grouped_results = _build_generic_grouped_aggregations(
+        df,
+        semantic_columns=semantic_columns,
+    )
+
     revenue_column = column_map.get("revenue")
     if not revenue_column or revenue_column not in df.columns:
-        return {}
+        return grouped_results
 
     dimensions = [
         ("region", "by_region", None),
         ("category", "by_category", None),
         ("product", "by_product", top_n_products),
     ]
-
-    grouped_results: dict[str, Any] = {}
 
     for canonical_dim, result_key, top_n in dimensions:
         raw_dim_col = column_map.get(canonical_dim)
@@ -301,3 +446,97 @@ def compute_grouped_aggregations(
         }
 
     return grouped_results
+
+
+def compute_generic_grouped_statistics(
+    df: pd.DataFrame,
+    semantic_columns: dict[str, str] | None = None,
+    max_group_columns: int = 5,
+    max_metric_columns: int = 12,
+    max_groups_per_column: int = 25,
+) -> dict[str, Any]:
+    semantic_columns = semantic_columns or {}
+    numeric_columns = [
+        str(col)
+        for col in df.select_dtypes(include="number").columns.tolist()
+        if not str(col).startswith("__")
+        and semantic_columns.get(str(col), "numeric_feature")
+        != "identifier"
+        if semantic_columns.get(str(col), "numeric_feature")
+        in {"measure", "numeric_feature", "derived_metric"}
+    ][:max_metric_columns]
+    group_columns = [
+        str(col)
+        for col in df.columns.tolist()
+        if semantic_columns.get(str(col)) in {"categorical", "boolean"}
+    ][:max_group_columns]
+
+    if not numeric_columns or not group_columns:
+        return {}
+
+    results: dict[str, Any] = {}
+
+    for group_col in group_columns:
+        working = df[[group_col, *numeric_columns]].copy()
+        working[group_col] = working[group_col].fillna("(missing)").astype(str)
+        for metric_col in numeric_columns:
+            working[metric_col] = coerce_numeric_series(working[metric_col])
+
+        grouped = working.groupby(group_col, dropna=False)
+        count_series = grouped.size().rename("row_count")
+        mean_df = grouped[numeric_columns].mean()
+        sum_df = grouped[numeric_columns].sum()
+        min_df = grouped[numeric_columns].min()
+        max_df = grouped[numeric_columns].max()
+
+        sort_metric = numeric_columns[0]
+        ordered_groups = (
+            mean_df[sort_metric]
+            .sort_values(ascending=False, na_position="last")
+            .head(max_groups_per_column)
+            .index
+        )
+
+        rows: list[dict[str, Any]] = []
+        for group_value in ordered_groups:
+            row: dict[str, Any] = {
+                group_col: _to_json_value(group_value),
+                "row_count": int(count_series.loc[group_value]),
+            }
+            for metric_col in numeric_columns:
+                row[f"{metric_col}_mean"] = _to_json_stat_value(
+                    mean_df.loc[group_value, metric_col]
+                )
+                row[f"{metric_col}_sum"] = _to_json_stat_value(
+                    sum_df.loc[group_value, metric_col]
+                )
+                row[f"{metric_col}_min"] = _to_json_stat_value(
+                    min_df.loc[group_value, metric_col]
+                )
+                row[f"{metric_col}_max"] = _to_json_stat_value(
+                    max_df.loc[group_value, metric_col]
+                )
+            rows.append(row)
+
+        top_mean_by_metric: dict[str, Any] = {}
+        for metric_col in numeric_columns:
+            metric_means = mean_df[metric_col].dropna()
+            if metric_means.empty:
+                continue
+            top_group = metric_means.idxmax()
+            top_mean_by_metric[metric_col] = {
+                "group_by_column": group_col,
+                "group": _to_json_value(top_group),
+                "mean": _to_json_stat_value(metric_means.loc[top_group]),
+                "row_count": int(count_series.loc[top_group]),
+            }
+
+        result_key = f"by_{group_col}"
+        results[result_key] = {
+            "group_by_column": group_col,
+            "metric_columns": numeric_columns,
+            "rows": rows,
+            "top_mean_by_metric": top_mean_by_metric,
+        }
+
+    return results

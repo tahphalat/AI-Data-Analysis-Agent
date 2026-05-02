@@ -1,15 +1,6 @@
-import asyncio
-
 import pandas as pd
-from starlette.requests import Request
 
-from app.routes.analyze import (
-    ANALYSIS_STORE,
-    DATASET_STORE,
-    FollowUpRequest,
-    answer_follow_up_question,
-    follow_up,
-)
+from app.routes.analyze import _build_analysis_payload
 from app.services import charting
 from app.services.profiler import profile_dataframe
 
@@ -25,6 +16,8 @@ def _iris_like_df() -> pd.DataFrame:
             "Id": [1, 2, 3, 4, 5, 6],
             "SepalLengthCm": [5.1, 4.9, 4.7, 6.0, 6.4, 6.9],
             "SepalWidthCm": [3.5, 3.0, 3.2, 2.2, 3.2, 3.1],
+            "PetalLengthCm": [1.4, 1.4, 1.3, 4.0, 4.5, 5.4],
+            "PetalWidthCm": [0.2, 0.2, 0.2, 1.0, 1.5, 2.1],
             "Species": [
                 "Iris-setosa",
                 "Iris-setosa",
@@ -147,66 +140,59 @@ def test_explicit_sequence_scatter_uses_row_order_for_id(monkeypatch) -> None:
     assert chart["rows"][0] == {"x": 0, "y": 1}
 
 
-def test_follow_up_rows_and_columns_uses_saved_summary() -> None:
-    df = _iris_like_df()
-    saved_analysis = {
-        "summary_for_user": "Dataset has 10,000 rows and 14 columns."
-    }
-
-    answer = answer_follow_up_question(
-        df,
-        "Dataset นี้มีกี่ rows และกี่ columns?",
-        saved_analysis,
-    )
-
-    assert answer == "Dataset has 10,000 rows and 14 columns."
-
-
-def test_follow_up_rows_and_columns_falls_back_to_dataframe_shape() -> None:
-    df = _iris_like_df()
-
-    answer = answer_follow_up_question(
-        df,
-        "ข้อมูลนี้มีกี่แถวและกี่คอลัมน์",
-        {},
-    )
-
-    assert answer == "Dataset นี้มีทั้งหมด 6 rows และ 4 columns."
-
-
-def test_follow_up_chart_request_uses_cached_dataset(monkeypatch) -> None:
+def test_initial_analysis_payload_includes_rich_analysis_context(monkeypatch) -> None:
     monkeypatch.setattr(charting, "_save_figure", _fake_save_figure)
-    dataset_id = "cached-iris"
-    DATASET_STORE[dataset_id] = _iris_like_df()
-    ANALYSIS_STORE[dataset_id] = {}
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/api/follow-up",
-            "headers": [],
-            "server": ("testserver", 80),
-            "scheme": "http",
-            "query_string": b"",
-        }
+
+    payload = _build_analysis_payload(
+        _iris_like_df(),
+        public_base_url="http://testserver",
     )
 
-    try:
-        response = asyncio.run(
-            follow_up(
-                FollowUpRequest(
-                    dataset_id=dataset_id,
-                    question="ขอสร้างกราฟ species ให้หน่อย",
-                ),
-                request,
-            )
-        )
-    finally:
-        DATASET_STORE.pop(dataset_id, None)
-        ANALYSIS_STORE.pop(dataset_id, None)
+    assert payload["chart_urls"]
+    assert payload["chart_metadata"]
+    assert payload["chart_markdown"]
+    assert payload["analysis_result"]
+    assert payload["analysis_result"]["summary_for_user"] == payload["summary_for_user"]
+    assert payload["analysis_result"]["chart_metadata"] == payload["chart_metadata"]
+    assert payload["chart_metadata"][0]["url"].startswith("http://testserver/test/")
+    assert {
+        "title",
+        "chart_type",
+        "columns",
+        "description",
+        "url",
+    }.issubset(payload["chart_metadata"][0])
+    assert payload["chart_metadata"][0]["url"] in payload["chart_markdown"]
 
-    assert response["success"] is True
-    assert response["answer"] == "สร้างกราฟจาก dataset เดิมให้แล้ว"
-    assert response["chart_urls"] == ["http://testserver/test/bar.png"]
-    assert response["chart_urls_text"] == "http://testserver/test/bar.png"
-    assert response["used_cached_dataset"] is True
+
+def test_analysis_payload_includes_species_feature_means() -> None:
+    payload = _build_analysis_payload(_iris_like_df())
+
+    grouped_stats = payload["generic_grouped_statistics"]["by_Species"]
+    setosa_row = next(
+        row for row in grouped_stats["rows"] if row["Species"] == "Iris-setosa"
+    )
+
+    assert grouped_stats["group_by_column"] == "Species"
+    assert grouped_stats["metric_columns"] == [
+        "SepalLengthCm",
+        "SepalWidthCm",
+        "PetalLengthCm",
+        "PetalWidthCm",
+    ]
+    assert setosa_row["SepalLengthCm_mean"] == 4.9
+    assert setosa_row["PetalWidthCm_mean"] == 0.2
+    assert grouped_stats["top_mean_by_metric"]["PetalLengthCm"] == {
+        "group_by_column": "Species",
+        "group": "Iris-virginica",
+        "mean": 5.4,
+        "row_count": 1,
+    }
+    assert (
+        payload["analysis_result"]["generic_grouped_statistics"]
+        == payload["generic_grouped_statistics"]
+    )
+    assert any(
+        "Iris-virginica" in insight and "PetalLengthCm" in insight
+        for insight in payload["insights"]
+    )
